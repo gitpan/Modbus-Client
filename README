@@ -1,0 +1,2 @@
+This module provides a basic Modbus client for reading from and writing to
+various ModBus slaves using RTU or ASCII modes.

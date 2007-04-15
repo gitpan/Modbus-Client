@@ -15,7 +15,7 @@ use FileHandle;
 
 use vars qw($VERSION @ISA @EXPORT);
 
-$VERSION = '1.00';
+$VERSION = '1.02';
 @ISA = qw(Exporter);
 @EXPORT = qw(M_RTU M_ASCII);
 my ($RCSVERSION) = '$Revision: 1.2 $ ' =~ /\$Revision:\s+([^\s]+)/;

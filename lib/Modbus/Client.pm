@@ -3,7 +3,7 @@ package Modbus::Client;
 =head1 DESCRIPTION
 
 This module provides a basic Modbus client for reading from and writing to
-various ModBus slaves using RTU or ASCII modes.
+various ModBus serial slaves using RTU or ASCII modes.
 
 =cut
 
@@ -18,9 +18,7 @@ use vars qw($VERSION @ISA @EXPORT);
 $VERSION = '1.00';
 @ISA = qw(Exporter);
 @EXPORT = qw(M_RTU M_ASCII);
-my ($RCSVERSION) = '$Revision$ ' =~ /\$Revision:\s+([^\s]+)/;
-
-#use POSIX;
+my ($RCSVERSION) = '$Revision: 1.2 $ ' =~ /\$Revision:\s+([^\s]+)/;
 
 # There is magic in the values chosen for these constants, specifically in how
 # many bytes are read from the device.
@@ -35,21 +33,37 @@ The Modbus::Client module defines the following methods:
 
 =item Modbus::Client->new()
 
-    $bus = new Modbus::Client "/dev/cua00", POSIX::B19200;
-    $bus = Modbus::Client->new(\*FD)
+Create a new serial client to talk to a ModBus.  Accepts two kinds of
+parameters - the first kind is the serial device the modbus is connected to.
+If this type of parameter is specified, Modbus::Client optionally accept a
+second paramater to define the baud rate.  By default, Modbus::Client will
+initiate communications at 9600 baud, no parity.
 
-Create a new client to talk to a ModBus.  Accepts two kinds of parameters -
-the first is the serial device the modbus is connected to.  If this type of
-parameter is specified, Modbus::Client optionally accept a second paramater
-to define the baud rate.  By default, Modbus::Client will initiate
-communications at 9600 baud, no parity.
+    $bus = new Modbus::Client "/dev/cua00", POSIX::B19200;
 
 The second type of parameter is a file handle.  If this parameter is passed,
 it is assumed that you have initiated the connection, and Modbus::Client will
 simply use the connection you have already established.  This allows you to
-easily use different baud rates or to connect to a TCP port (this is typically
-port 502 [asa-appl-proto] as specified by the Modbus Specs, found at
-L<http://www.modbus.org/specs.php>).
+easily use different baud rates or to connect to a TCP port associated with a
+serial-to-ether adapter, such as the Digi One SP.  For devices like this,
+make sure you DISABLE software flow control!
+
+    use FileHandle;
+    use Socket;
+    $fd = new FileHandle;
+    $host = "something.yournet.com";
+    $port = 2101;
+    $remote = inet_aton($host)	|| die "No such host $host";
+    socket($fd, PF_INET, SOCK_STREAM, getprotobyname('tcp'))
+				|| die "Can't create socket - $!";
+    $paddr = sockaddr_in($port, $remote);
+    connect($fd, $paddr)	|| die "Can't connect to $host:$port - $!";
+    $fd->autoflush(1);
+    $bus = Modbus::Client->new($fd);
+
+NOTE FOR WINDOWS USERS: For finer control of the serial connection, it is
+I<possibly> better if you open the connection and pass the FileHandle to the
+I<new> method.  This is because Windows does not implement POSIX::Termios.
 
 =cut
 
@@ -61,44 +75,46 @@ sub new {
 	$serial = $device;
 	}
     else {
-	$serial = new FileHandle($device, O_RDWR | O_NDELAY | O_NOCTTY) 
-	    or die "Can't open $device $!\n";
+	if ($^O ne "MSWin32") {
+	    $serial = new FileHandle($device, O_RDWR | O_NDELAY | O_NOCTTY) 
+		or die "Can't open $device $!\n";
 
-	#
-	# System dependent?
-	# 1) Open enersure non-blocking, but then reset that flag (has to do
-	# 	with DTR not being asserted)
-	# 2) Set baud rate
-	# 3) Enable reader, don't monitor DTR, etc, 8 bits, 2 stop bits
-	#
-	my $cflag = CS8 | HUPCL | CREAD | CLOCAL;
-	my $lflag = 0;	# No local processing (raw mode)
-	my $iflag = IGNBRK | IGNPAR;
-	my $oflag = 0;	# No output post-processing
-	my $termios = POSIX::Termios->new();
+	    #
+	    # System dependent?
+	    # 1) Open enersure non-blocking, but then reset that flag (has to do
+	    # 	with DTR not being asserted)
+	    # 2) Set baud rate
+	    # 3) Enable reader, don't monitor DTR, etc, 8 bits, 2 stop bits
+	    #
+	    my $cflag = CS8 | HUPCL | CREAD | CLOCAL;
+	    my $lflag = 0;	# No local processing (raw mode)
+	    my $iflag = IGNBRK | IGNPAR;
+	    my $oflag = 0;	# No output post-processing
+	    my $termios = POSIX::Termios->new();
 
-	$termios->getattr($serial->fileno())
-	    or die "getattr failed: $!\n";
+	    $termios->getattr($serial->fileno())
+		or die "getattr failed: $!\n";
 
-	$termios->setcflag($cflag);
-	$termios->setlflag($lflag);
-	$termios->setiflag($iflag);
-	$termios->setoflag($oflag);
-	$termios->setcc(VTIME, 10);	# 10 * .1 == 1 sec timeout on read
-	$termios->setcc(VMIN, 0);	# Purely time-based timeouts
+	    $termios->setcflag($cflag);
+	    $termios->setlflag($lflag);
+	    $termios->setiflag($iflag);
+	    $termios->setoflag($oflag);
+	    $termios->setcc(VTIME, 10);	# 10 * .1 == 1 sec timeout on read
+	    $termios->setcc(VMIN, 0);	# Purely time-based timeouts
 
-	$termios->setattr($serial->fileno(),TCSANOW)
-	    or die "setattr failed 1: $!\n";
-	$termios->setospeed($speed || POSIX::B9600)
-	    or die "setospeed failed: \$!\n";
-	$termios->setispeed($speed || POSIX::B9600)
-	    or die "setispeed failed: \$!\n";
-	$termios->setattr($serial->fileno(),TCSANOW)
-	    or die "setattr 2 failed: $!\n";
+	    $termios->setattr($serial->fileno(),TCSANOW)
+		or die "setattr failed 1: $!\n";
+	    $termios->setospeed($speed || POSIX::B9600)
+		or die "setospeed failed: \$!\n";
+	    $termios->setispeed($speed || POSIX::B9600)
+		or die "setispeed failed: \$!\n";
+	    $termios->setattr($serial->fileno(),TCSANOW)
+		or die "setattr 2 failed: $!\n";
 
-	# This gets rid of all the special characters..
-	$termios->getattr($serial->fileno())
-	    or die "getattr failed: $!\n";
+	    # This gets rid of all the special characters..
+	    $termios->getattr($serial->fileno())
+		or die "getattr failed: $!\n";
+	    }
 
 	$serial = new FileHandle($device, O_RDWR | O_NOCTTY)
 	    or die "Can't open $device $!\n";
@@ -140,15 +156,18 @@ sub device {
 
 sub _my_read {
     my ($self, undef, $cnt) = @_;
-    my ($buf, $chr, $total);
+    my ($buf, $chr, $rin, $rout);
+    my $total = 0;
 
+    vec($rin, $self->{fh}->fileno, 1) = 1;
     while ($cnt--) {
+	last unless select($rout=$rin, undef, undef, 1);
 	last unless sysread($self->{fh}, $chr, 1);
 	$buf .= $chr;
 	$total++;
 	}
     if ($self->{bus}->{debug}) {
-	print STDERR "Modbus::Client Reading: ";
+	print STDERR "Modbus::Client Reading $total chars: ";
 	if ($self->{bus}->{mode} == M_RTU) {
 	    for (0..length($buf)-1) {
 		printf STDERR "%02x", ord(substr($buf,$_,1));

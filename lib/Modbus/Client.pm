@@ -15,10 +15,10 @@ use FileHandle;
 
 use vars qw($VERSION @ISA @EXPORT);
 
-$VERSION = '1.02';
+$VERSION = '1.03';
 @ISA = qw(Exporter);
 @EXPORT = qw(M_RTU M_ASCII);
-my ($RCSVERSION) = '$Revision: 1.2 $ ' =~ /\$Revision:\s+([^\s]+)/;
+my ($RCSVERSION) = '$Revision: 1.3 $ ' =~ /\$Revision:\s+([^\s]+)/;
 
 # There is magic in the values chosen for these constants, specifically in how
 # many bytes are read from the device.
@@ -132,7 +132,7 @@ sub new {
     return $self;
 }
 
-=item $bus->device
+=item $bus->device()
 
 Create a new device on a Modbus.  The single parameter is the device number.
 Note that according to the Modbus spec, a device number of 0 is the broadcast
@@ -238,6 +238,17 @@ queues - ask and ye shall receive, though...
 
 =cut
 
+my @exception = ("",	# 0 == no exception
+		 "ILLEGAL FUNCTION",
+		 "ILLEGAL DATA ADRESS",
+		 "ILLEGAL DATA VALUE".
+		 "SLAVE DEVICE FAILURE",
+		 "ACKNOWLEDGE",
+		 "SLAVE DEVICE BUSY",
+		 "NEGATIVE ACKNOWLEDGE",
+		 "MEMORY PARITY ERROR",
+		);
+
 sub read {
     my $self = shift;
     my @regs = @_;
@@ -304,13 +315,61 @@ sub read {
 		}
 	    }
 	syswrite($self->{fh}, $cmd);
-	my ($buf, $tmp, $nbytes);
-	# Read the echoed address and command
-	$ocnt = $self->_my_read($buf, $icnt = 2 * $self->{bus}->{mode});
+	my ($buf, $tmp, $nbytes, $want, $got);
+	# Read the echoed address
+	$ocnt = $self->_my_read($tmp, $icnt = 1 * $self->{bus}->{mode});
 	die "Unexpected return from Modbus device (@{[$ocnt||0]} bytes)"
-	    unless $ocnt == $icnt &&
-		(($self->{bus}->{mode} == M_ASCII && $buf == $self->{addr}) ||
-		 ($self->{bus}->{mode} == M_RTU && $buf eq pack('cc', $self->{addr}, $fn)));
+	    unless $ocnt == $icnt;
+	$want = $self->{addr};
+	$got = $self->{bus}->{mode} == M_ASCII ? hex($tmp) : ord($tmp);
+	if ($got != $want) {
+	    die "Unexpected return from Modbus device (addr echo mismatch)"
+	    }
+	$buf .= $tmp;
+	# Read the echoed command
+	$ocnt = $self->_my_read($tmp, $icnt = 1 * $self->{bus}->{mode});
+	die "Unexpected return from Modbus device (@{[$ocnt||0]} bytes)"
+	    unless $ocnt == $icnt;
+	$buf .= $tmp;
+	$want = $fn;
+	$got = $self->{bus}->{mode} == M_ASCII ? hex($tmp) : ord($tmp);
+	if ($got != $want) {
+	    # Error handling...
+	    if (($got & 0x7f) == $want) {
+		my $err;
+		$ocnt = $self->_my_read($tmp, $icnt = 1 * $self->{bus}->{mode});
+		die "Unexpected return from Modbus device (@{[$ocnt||0]} bytes)"
+		    unless $ocnt == $icnt;
+		$buf .= $tmp;
+		$got = $self->{bus}->{mode} == M_ASCII ? hex($tmp) : ord($tmp);
+		$ocnt = $self->_my_read($tmp, $icnt = 2);
+		die "Unexpected return from Modbus device (@{[$ocnt||0]} bytes)"
+		    unless $ocnt == $icnt;
+		$buf .= $tmp;
+		if ($self->{bus}->{mode} == M_ASCII) {
+		    if (_verify_lrc($buf)) {
+			$err = hex(substr($buf, 4, 2));
+			warn "Modbus Exception: $exception[$err]";
+			}
+		    else {
+			warn "Bad error LRC from device\n";
+			}
+		    }
+		else {
+		    if (_verify_crc($buf)) {
+			$err = ord(substr($buf, 2, 1));
+			warn "Modbus Exception: $exception[$err]";
+			}
+		    else {
+			warn "Bad error CRC from device\n";
+			}
+		    }
+		}
+	    else {
+		die "Unexpected return from Modbus device (cmd echo mismatch)"
+		}
+	    return undef;
+	    }
 	# Read the byte count
 	$ocnt = $self->_my_read($tmp, $icnt = 1 * $self->{bus}->{mode});
 	if ($self->{bus}->{mode} == M_ASCII) {
@@ -322,40 +381,31 @@ sub read {
 	die "Odd byte count returned from device\n" if $fn > 0x3 && $nbytes & 1;
 	$buf .= $tmp;
 	if ($this_set[0] < 20000) {
-	    warn "'Read Input Status' and 'Read Coil Status' code is untested";
-	    my $nval = scalar(@this_set);
+	    my $nval = @this_set;
 	    my $idx = $base + $start + 1;
-	    my ($bit, $byte);
-	    for my $byte_num (0..$nval/8) {
+	    my ($bit, $byte, $nbits);
+	    for (1..$nbytes) {
 		$ocnt = $self->_my_read($tmp, $icnt = 1 * $self->{bus}->{mode});
 		die "Didn't get byte $_ from device\n"	unless $ocnt == $icnt;
+		$buf .= $tmp;
 		#
 		# All sorts of endian issues here.  The MSB contains the first
 		# bit, but if there are fewer than 8 bits, they are 0 padded
 		# to the left.  What idiot designed this?
 		#
-		$bit = 0x80;
 		if ($self->{bus}->{mode} == M_ASCII) {
 		    $byte = hex($tmp);
 		    }
 		else {
-		    $byte = unpack('n', $tmp);
+		    $byte = ord($tmp);
 		    }
-		if ($nval >= 8) {
-		    for (0..7) {
-			push @retval, $regs->{$idx++} = $byte & $bit;
-			$bit >>= 1;
-			$nval--;
-			}
+		$bit = 0x01;
+		$nbits = $nval > 8 ? 8 : $nval;
+		for (1..$nbits) {
+		    push @retval, ($regs->{$idx++} = ($byte & 1));
+		    $byte >>= 1;
+		    $nval--;
 		    }
-		else {
-		    $bit >>= 8-$nval;
-		    for (0..$nval-1) {
-			push @retval, $regs->{$idx++} = $byte & $bit;
-			$bit >>= 1;
-			}
-		    }
-		$buf .= $tmp;
 		}
 	    }
 	elsif ($this_set[0] > 30000 && $this_set[0] < 50000) {
@@ -365,6 +415,7 @@ sub read {
 		$ocnt = $self->_my_read($tmp, $icnt = 2 * $self->{bus}->{mode});
 		die "Didn't get @{[$ocnt||0]} != 2 bytes for data element $_ from device\n"
 		    unless $ocnt == $icnt;
+		$buf .= $tmp;
 		if ($self->{bus}->{mode} == M_ASCII) {
 		    $val = hex($tmp);
 		    }
@@ -372,17 +423,16 @@ sub read {
 		    $val = unpack('n', $tmp);
 		    }
 		push @retval, $regs->{$_ + $base + $start - 1} = $val;
-		$buf .= $tmp;
 		}
-	    # Finally, read the CRC
-	    $ocnt = $self->_my_read($tmp, 2);
-	    die "Didn't get @{[$ocnt||0]} != 2 bytes for CRC/LRC from device\n"
-		unless $ocnt == 2;
-	    $buf .= $tmp;
 	    }
 	else {
 	    die "Shouldn't get here!";
 	    }
+	# Finally, read the CRC/LRC and verify correctness
+	$ocnt = $self->_my_read($tmp, 2);
+	die "Didn't get @{[$ocnt||0]} != 2 bytes for CRC/LRC from device\n"
+	    unless $ocnt == 2;
+	$buf .= $tmp;
 	if ($self->{bus}->{mode} == M_ASCII) {
 	    warn "Bad LRC from device\n"	unless _verify_lrc($buf);
 	    }
@@ -446,17 +496,16 @@ sub write {
 	    }
 	if ($this_set[0]  > 0 && $this_set[0] < 10000) {
 	    $base = 00001;
+	    $start = $this_set[0] - $base;
 	    if (@this_set == 1) {
 		$fn = 0x05;
-		$start = $this_set[0] - $base;
 		$cmd = pack('ccnn', $self->{addr}, $fn, $start,
-		    $this_set[0] ? 0xff00 : 0);
+		    $regs{$this_set[0]} ? 0xff00 : 0x0000);
 		$resp = $cmd;
 		}
 	    else {
 		my ($bit, $byte, @subset);
 		$fn = 0x0f;
-		$start = $this_set[0] - $base;
 		$cmd = pack('ccnn', $self->{addr}, $fn, $start,
 		    scalar(@this_set));
 		$resp = $cmd;
@@ -479,16 +528,15 @@ sub write {
 	    }
 	elsif ($this_set[0] > 40000 && $this_set[0] < 50000) {
 	    $base = 40001;
+	    $start = $this_set[0] - $base;
 	    if (@this_set == 1) {
 		$fn = 0x06;
-		$start = $this_set[0] - $base;
 		$cmd = pack('ccnn', $self->{addr}, $fn, $start,
 		    $regs{$this_set[0]});
 		$resp = $cmd;
 		}
 	    else {
 		$fn = 0x10;
-		$start = $this_set[0] - $base;
 		$cmd = pack('ccnn', $self->{addr}, $fn, $start,
 		    scalar(@this_set));
 		$resp = $cmd;
@@ -522,23 +570,45 @@ sub write {
 		}
 	    }
 	syswrite($self->{fh}, $cmd);
-	my ($buf, $tmp, $nbytes);
+	my ($buf, $nbytes, $err);
 	# Read the echoed address and command
 	$ocnt = $self->_my_read($buf, $icnt = length($resp));
 	if ($ocnt != $icnt || $buf ne $resp) {
-	    if ($self->{bus}->{debug}) {
-		print STDERR "Modbus::Client Expected: ";
-		for (0..length($resp)-1) {
-		    printf STDERR "%02x", ord(substr($resp,$_,1));
+	    if ($self->{bus}->{mode} == M_ASCII) {
+		if ($self->{bus}->{debug}) {
+		    print STDERR "Modbus::Client Expected: $resp\n";
+		    print STDERR "Modbus::Client Got     : $buf\n";
 		    }
-		print STDERR "\n";
-		print STDERR "Modbus::Client Got     : ";
-		for (0..length($buf)-1) {
-		    printf STDERR "%02x", ord(substr($buf,$_,1));
+		if (_verify_lrc($buf)) {
+		    $err = hex(substr($buf, 4, 2));
+		    warn "Modbus Exception: $exception[$err]";
 		    }
-		print STDERR "\n";
+		else {
+		    warn "Bad error LRC from device\n";
+		    }
 		}
-	    die "Unexpected return from Modbus device (@{[$ocnt||0]} bytes)"
+	    else {
+		if ($self->{bus}->{debug}) {
+		    print STDERR "Modbus::Client Expected: ";
+		    for (0..length($resp)-1) {
+			printf STDERR "%02x", ord(substr($resp,$_,1));
+			}
+		    print STDERR "\n";
+		    print STDERR "Modbus::Client Got     : ";
+		    for (0..length($buf)-1) {
+			printf STDERR "%02x", ord(substr($buf,$_,1));
+			}
+		    print STDERR "\n";
+		    }
+		if (_verify_crc($buf)) {
+		    $err = ord(substr($buf, 2, 1));
+		    warn "Modbus Exception: $exception[$err]";
+		    }
+		else {
+		    warn "Bad error CRC from device\n";
+		    }
+		}
+	    return undef;
 	    }
 	}
     }
@@ -581,8 +651,8 @@ sub _lrc {
     my $str = shift;
     my $lrc = 0;
 
-    for my $i (0..length($str)-1) {
-	$lrc += ord(substr($str, $i, 1));
+    for my $char (split //, $str) {
+	$lrc += ord($char);
 	}
     return sprintf "%02x", -$lrc & 0xFF;
     }
